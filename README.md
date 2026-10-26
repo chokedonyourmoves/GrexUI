@@ -1,32 +1,3 @@
-```markdown
-# 🦎 Kewl GUI
-
-A modular ESP, Chams, and silent-aim suite built on **Rayfield Gen 2**, designed as an educational reference for how these systems fit together in Lua.
-
-> **Educational use only.** This project is intended for private servers, Studio testing, or your own game. Using it on live Roblox servers violates the Terms of Service and harms other players. See [Disclaimer](#disclaimer).
-
----
-
-## Table of Contents
-
-- [Features](#features)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Feature Reference](#feature-reference)
-  - [Combat](#-combat)
-  - [Visuals](#️-visuals)
-  - [World](#️-world)
-  - [Config](#️-config)
-  - [Always-On Behavior](#always-on-behavior)
-- [Profiles](#profiles)
-- [Architecture](#architecture)
-- [Detection Resistance](#detection-resistance)
-- [Limitations](#limitations)
-- [Disclaimer](#disclaimer)
-- [License](#license)
-
----
-
 ## Features
 
 - **ESP** — boxes, healthbars, names, distance, team check, max distance
@@ -47,14 +18,14 @@ A modular ESP, Chams, and silent-aim suite built on **Rayfield Gen 2**, designed
 
 ## Installation
 
-Kewl GUI is a single Lua file. There is no build step.
+Grex UI is a single Lua file. There is no build step.
 
 ### Option 1 — Load from URL
 
 Paste this one line into your executor while Roblox is running:
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/chokedonyourmoves/KewlGUI/refs/heads/main/KewlGUI.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/chokedonyourmoves/GrexUI/refs/heads/main/GrexUI.lua"))()
 ```
 
 Your script file should begin with its own Rayfield loadstring call:
@@ -65,7 +36,7 @@ local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
 
 ### Option 2 — Paste directly
 
-Paste the entire `KewlGUI.lua` contents into the executor and click Execute.
+Paste the entire `GrexUI.lua` contents into the executor and click Execute.
 
 ### Executor requirements
 
@@ -214,7 +185,7 @@ These run regardless of toggles:
 | pcall guards | Update loop + teardown are individually protected |
 | Shared raycast | One wall-check raycast feeds both aimlock and triggerbot |
 | Chams team check | Respects Team Check per frame |
-| Auto-save | Every setting change persists to `KewlGUI/KewlConfig` |
+| Auto-save | Every setting change persists to `GrexUI/KewlConfig` |
 
 ### Feature totals
 
