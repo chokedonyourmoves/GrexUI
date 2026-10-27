@@ -1,3 +1,5 @@
+Basically KewlGUI but complete version
+
 ## Features
 
 - **ESP** — boxes, healthbars, names, distance, team check, max distance
