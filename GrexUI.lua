@@ -21,19 +21,23 @@ local frameCounter = 0
 local rewritesThisSecond = 0
 local rewriteSecond = 0
 
+-- Desync state
+local desyncThread = nil
+local desyncSavedVelocity = nil
+
 -- Element handles (for profiles)
 local Handles = {}
 
 local Settings = {
     -- Combat
     AimEnabled = false,
-    AimMode = "Silent",          -- "Silent" | "Camera"
+    AimMode = "Silent",
     AimSmooth = 0,
     AimFOVSize = 120,
     AimFOVColor = Color3.fromRGB(255, 0, 0),
     ShowAimFOV = true,
     AimMaxDistance = 1000,
-    TargetPriority = "Crosshair", -- Crosshair | Distance | LowestHealth | Threat
+    TargetPriority = "Crosshair",
     TargetPart = "Head",
     Predict = true,
     PredictionAmount = 1,
@@ -74,7 +78,13 @@ local Settings = {
     Fullbright = false,
 
     -- Performance
-    PerformanceMode = false,   -- process ESP every other frame
+    PerformanceMode = false,
+
+    -- Desync
+    DesyncEnabled = false,
+    DesyncMethod = "Anchor",
+    DesyncFreezeDuration = 0.5,
+    DesyncCycleInterval = 1.0,
 }
 
 -- ═══ PROFILES ═══════════════════════════════════════════════
@@ -112,11 +122,20 @@ AimFOVCircle.Filled = false
 AimFOVCircle.Transparency = 1
 AimFOVCircle.NumSides = 64
 
--- ─── Friends cache ──────────────────────────────────────────
+-- ─── Helpers ────────────────────────────────────────────────
+local function GetCharacter()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char.PrimaryPart
+    if not (char and hum and root and hum.Health > 0) then return nil end
+    return char, hum, root
+end
+
 local function RefreshFriendStatus(player)
     local ok, res = pcall(function() return LocalPlayer:IsFriendsWith(player.UserId) end)
     FriendsCache[player.UserId] = ok and res or false
 end
+
 local function IsFriend(player)
     return FriendsCache[player.UserId] == true
 end
@@ -152,10 +171,10 @@ end
 -- ─── Chams lifecycle ────────────────────────────────────────
 local function ApplyChams(char)
     if not char then return nil end
-    local hl = char:FindFirstChild("KewlChams")
+    local hl = char:FindFirstChild("GrexChams")
     if not hl then
         hl = Instance.new("Highlight")
-        hl.Name = "KewlChams"
+        hl.Name = "GrexChams"
         hl.Adornee = char
         hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
         hl.Parent = char
@@ -240,10 +259,7 @@ local function ApplyCameraLock()
     end
 
     local alpha = math.clamp(1 - Settings.AimSmooth, 0.01, 1)
-    if Settings.StealthMode then
-        -- ease-out: fast initial correction, slow settle (less robotic than linear lerp)
-        alpha = alpha * alpha
-    end
+    if Settings.StealthMode then alpha = alpha * alpha end
     local goal = CFrame.new(Camera.CFrame.Position, targetPos)
     Camera.CFrame = Camera.CFrame:Lerp(goal, alpha)
 end
@@ -257,15 +273,95 @@ local function IsBetterTarget(player, char, hum, root, dist3d, screenDist, bestS
     elseif prio == "LowestHealth" then
         return hum.Health < bestScore
     elseif prio == "Threat" then
-        -- crude threat: closer + aiming roughly at us
         local look = Camera.CFrame.LookVector
         local toMe = (LocalPlayer.Character and LocalPlayer.Character.PrimaryPart
             and (LocalPlayer.Character.PrimaryPart.Position - root.Position).Unit) or Vector3.zero
         local threat = (1 - look:Dot(toMe)) * 0.5 + dist3d / Settings.AimMaxDistance
         return threat < bestScore
     end
-    -- default: Crosshair
     return screenDist < bestScore
+end
+
+-- ═══ DESYNC METHODS ═════════════════════════════════════════
+-- Educational reference only. On modern Roblox servers, most of these
+-- are corrected by server-side position integrity checks within 1–2s.
+
+local function DesyncAnchor()
+    local _, _, root = GetCharacter()
+    if not root then return end
+    desyncSavedVelocity = root.AssemblyLinearVelocity
+    pcall(function() root.Anchored = true end)
+    task.wait(Settings.DesyncFreezeDuration)
+    pcall(function()
+        root.Anchored = false
+        if desyncSavedVelocity then
+            root.AssemblyLinearVelocity = desyncSavedVelocity
+        end
+    end)
+end
+
+local function DesyncVelocity()
+    local _, _, root = GetCharacter()
+    if not root then return end
+    local dir = Camera.CFrame.LookVector
+    pcall(function()
+        root.AssemblyLinearVelocity = dir * 500 + Vector3.new(0, 50, 0)
+    end)
+    task.wait(0.05)
+    pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+end
+
+local function DesyncHumanoidState()
+    local char, hum = GetCharacter()
+    if not (char and hum) then return end
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+    task.wait(Settings.DesyncFreezeDuration)
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+end
+
+local function DesyncOwnership()
+    local _, _, root = GetCharacter()
+    if not root then return end
+    pcall(function() root:SetNetworkOwner(nil) end)
+    task.wait(Settings.DesyncFreezeDuration)
+end
+
+local DesyncMethods = {
+    Anchor = DesyncAnchor,
+    Velocity = DesyncVelocity,
+    HumanoidState = DesyncHumanoidState,
+    Ownership = DesyncOwnership,
+}
+
+local function DesyncLoop()
+    while Settings.DesyncEnabled do
+        local char = GetCharacter()
+        if char then
+            local method = DesyncMethods[Settings.DesyncMethod]
+            if method then pcall(method) end
+        end
+        task.wait(Settings.DesyncCycleInterval)
+    end
+end
+
+local function ToggleDesync(en)
+    Settings.DesyncEnabled = en
+    if en then
+        if not desyncThread then
+            desyncThread = task.spawn(DesyncLoop)
+        end
+    else
+        desyncThread = nil
+        -- Always restore a safe state on disable
+        local _, hum, root = GetCharacter()
+        if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end) end
+        if root then
+            pcall(function()
+                root.Anchored = false
+                root.AssemblyLinearVelocity = Vector3.zero
+            end)
+        end
+    end
 end
 
 -- ─── Main loop ──────────────────────────────────────────────
@@ -274,7 +370,6 @@ local function UpdateAll()
         return
     end
 
-    -- Performance: skip ESP rendering every other frame when enabled
     frameCounter = frameCounter + 1
     local renderThisFrame = true
     if Settings.PerformanceMode and frameCounter % 2 ~= 0 then
@@ -335,7 +430,6 @@ local function UpdateAll()
 
                 local screenDist = (Vector2.new(headScreen.X, headScreen.Y) - center2d).Magnitude
 
-                -- Aim target selection
                 if Settings.AimEnabled and onScreen and not blocked
                     and screenDist <= Settings.AimFOVSize
                     and dist3d <= Settings.AimMaxDistance
@@ -348,7 +442,6 @@ local function UpdateAll()
                     end
                 end
 
-                -- Triggerbot
                 if Settings.Triggerbot and onScreen and not blocked
                     and screenDist <= Settings.TriggerbotFOV
                     and dist3d <= Settings.AimMaxDistance
@@ -359,7 +452,6 @@ local function UpdateAll()
                     end
                 end
 
-                -- ESP rendering
                 if not renderThisFrame then continue end
 
                 if not onScreen or teamBlocked then
@@ -432,10 +524,9 @@ local function UpdateAll()
     ApplyCameraLock()
 end
 
--- Safe wrapper so one bad character cannot kill the loop
 local function SafeUpdate()
     local ok, err = pcall(UpdateAll)
-    if not ok then warn("[Kewl] UpdateAll error:", err) end
+    if not ok then warn("[Grex] UpdateAll error:", err) end
 end
 
 -- ─── Predicted aim point ────────────────────────────────────
@@ -466,7 +557,6 @@ local function GetPredictedPos(targetPlayer)
         end
     end
 
-    -- per-shot hitbox randomisation (already present, keeps offsets small)
     local s = Settings.HitboxSize
     targetPos = targetPos + Vector3.new(
         math.random(-100, 100) / 100 * s,
@@ -474,7 +564,6 @@ local function GetPredictedPos(targetPlayer)
         math.random(-100, 100) / 100 * s
     )
 
-    -- stealth jitter: tiny angular noise so every shot is not pixel-identical
     if Settings.StealthMode and Settings.AimJitter > 0 then
         targetPos = targetPos + Vector3.new(
             math.random(-100, 100) / 100 * Settings.AimJitter,
@@ -497,7 +586,6 @@ mt.__namecall = newcclosure(function(self, ...)
     if Settings.AimEnabled and Settings.AimMode == "Silent" and Settings.Tracking
         and ClosestTarget and method == "Raycast" and self == workspace then
 
-        -- rate limit: no more than N rewrites per second
         local now = os.clock()
         if now - rewriteSecond >= 1 then
             rewriteSecond = now
@@ -514,7 +602,6 @@ mt.__namecall = newcclosure(function(self, ...)
             local finalDir = desiredDir
             if Settings.AimSmooth > 0 then
                 local alpha = math.clamp(1 - Settings.AimSmooth, 0.01, 1)
-                -- stealth: ease-out instead of linear lerp
                 if Settings.StealthMode then alpha = alpha * alpha end
                 finalDir = direction.Unit:Lerp(desiredDir, alpha).Unit
             end
@@ -529,6 +616,20 @@ setreadonly(mt, true)
 
 -- ─── Teardown ───────────────────────────────────────────────
 local function DestroyAll()
+    -- Stop desync and restore a safe state
+    Settings.DesyncEnabled = false
+    desyncThread = nil
+    do
+        local _, hum, root = GetCharacter()
+        if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end) end
+        if root then
+            pcall(function()
+                root.Anchored = false
+                root.AssemblyLinearVelocity = Vector3.zero
+            end)
+        end
+    end
+
     pcall(function() setreadonly(mt, false); mt.__namecall = oldRaycast; setreadonly(mt, true) end)
     for p in pairs(EspObjects) do RemoveEsp(p) end
     for p, hl in pairs(ChamsObjects) do pcall(function() if hl and hl.Parent then hl:Destroy() end end) end
@@ -554,8 +655,7 @@ table.insert(Connections, Players.PlayerRemoving:Connect(function(p)
     ChamsObjects[p] = nil
     FriendsCache[p.UserId] = nil
 end))
--- Character removal: hide ESP immediately so boxes don't freeze on death
-table.insert(Connections, Players.PlayerRemoving:Connect(function() end))
+
 for _, p in ipairs(Players:GetPlayers()) do
     table.insert(Connections, p.CharacterRemoving:Connect(function()
         local esp = EspObjects[p]
@@ -573,12 +673,12 @@ table.insert(Connections, RunService.RenderStepped:Connect(SafeUpdate))
 
 -- ═══ UI (Rayfield Gen2) ═════════════════════════════════════
 local Window = Rayfield:CreateWindow({
-    name = "🦎 Kewl GUI",
-    subtitle = "Rayfield Gen2 · Complete",
+    name = "🦎 Grex UI",
+    subtitle = "Rayfield Gen2",
     sidebarLayout = true,
     configuration = {
         autoSave = true, autoLoad = true,
-        fileName = "KewlConfig", customFolder = "KewlGUI",
+        fileName = "GrexConfig", customFolder = "GrexUI",
     },
 })
 
@@ -598,7 +698,7 @@ CombatTab:CreateKeybind({
     callback = function()
         local new = not Settings.AimEnabled
         Settings.AimEnabled = new
-        aimToggle:Set(new, true) -- silent UI sync
+        aimToggle:Set(new, true)
     end,
 })
 
@@ -785,6 +885,64 @@ VisualsTab:CreateColorPicker({
     callback = function(c) Settings.PlayerTracerColor = c end,
 })
 
+-- ══ DESYNC ═════════════════════════════════════════════════
+local DesyncTab = Window:CreateTab({ name = "Desync", icon = "wifi-off" })
+
+DesyncTab:CreateSection("Position Desync")
+
+DesyncTab:CreateToggle({
+    name = "Enable Desync",
+    value = Settings.DesyncEnabled,
+    flag = "DS_Main",
+    callback = ToggleDesync,
+})
+
+DesyncTab:CreateDropdown({
+    name = "Method",
+    options = { "Anchor", "Velocity", "HumanoidState", "Ownership" },
+    multiSelect = false,
+    value = Settings.DesyncMethod,
+    flag = "DS_Method",
+    callback = function(v) Settings.DesyncMethod = v end,
+})
+
+DesyncTab:CreateSlider({
+    name = "Freeze Duration (s)",
+    range = { 0.05, 2 },
+    increment = 0.05,
+    value = Settings.DesyncFreezeDuration,
+    flag = "DS_FreezeDuration",
+    callback = function(v) Settings.DesyncFreezeDuration = v end,
+})
+
+DesyncTab:CreateSlider({
+    name = "Cycle Interval (s)",
+    range = { 0.1, 5 },
+    increment = 0.1,
+    value = Settings.DesyncCycleInterval,
+    flag = "DS_CycleInterval",
+    callback = function(v) Settings.DesyncCycleInterval = v end,
+})
+
+DesyncTab:CreateSection("Diagnostics")
+
+DesyncTab:CreateButton({
+    name = "Log Position (3s)",
+    callback = function()
+        local _, _, root = GetCharacter()
+        if not root then return end
+        local startPos = root.Position
+        print(string.format("[Grex] Start: %.1f, %.1f, %.1f", startPos.X, startPos.Y, startPos.Z))
+        task.wait(3)
+        local _, _, root2 = GetCharacter()
+        if not root2 then return end
+        local endPos = root2.Position
+        local delta = (endPos - startPos).Magnitude
+        print(string.format("[Grex] End: %.1f, %.1f, %.1f (moved %.1f studs)",
+            endPos.X, endPos.Y, endPos.Z, delta))
+    end,
+})
+
 -- ══ WORLD ══════════════════════════════════════════════════
 local WorldTab = Window:CreateTab({ name = "World", icon = "sun" })
 
@@ -800,7 +958,7 @@ WorldTab:CreateButton({
     end,
 })
 
--- ══ CONFIG / PERFORMANCE / STEALTH ═════════════════════════
+-- ══ CONFIG ═════════════════════════════════════════════════
 local ConfigTab = Window:CreateTab({ name = "Config", icon = "settings" })
 
 ConfigTab:CreateSection("Profiles")
