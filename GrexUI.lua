@@ -1,4 +1,34 @@
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+-- ═══ FEATURE DETECTION ═════════════════════════════════════
+local Features = {}
+do
+    local function HasFunction(name)
+        local fn = _ENV[name] or (getgenv and getgenv()[name])
+        return type(fn) == "function"
+    end
+
+    Features.Drawing = HasFunction("Drawing") or (type(Drawing) == "table" and type(Drawing.new) == "function")
+    Features.Metatable = HasFunction("getrawmetatable")
+    Features.Newcclosure = HasFunction("newcclosure")
+    Features.Setreadonly = HasFunction("setreadonly")
+    Features.Getnamecall = HasFunction("getnamecallmethod")
+    Features.Setclipboard = HasFunction("setclipboard")
+end
+
+-- Hard requirement check for the silent-aim hook
+local HookReady = Features.Metatable and Features.Newcclosure
+    and Features.Setreadonly and Features.Getnamecall
+
+local Rayfield
+do
+    local ok, result = pcall(function()
+        return loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+    end)
+    if not ok or not result then
+        warn("[Grex] Rayfield Gen2 failed to load. Aborting.")
+        return
+    end
+    Rayfield = result
+end
 
 -- Services
 local Players = game:GetService("Players")
@@ -6,88 +36,61 @@ local RunService = game:GetService("RunService")
 local Stats = game:GetService("Stats")
 local Lighting = game:GetService("Lighting")
 local VirtualUser = game:GetService("VirtualUser")
-local Camera = workspace.CurrentCamera
 
--- State
 local LocalPlayer = Players.LocalPlayer
+
+-- ═══ STATE ═════════════════════════════════════════════════
 local EspObjects = {}
 local ChamsObjects = {}
 local FriendsCache = {}
+local VisibilityCache = {}    -- [player] = { visible, key, tick }
+local RandomPartCache = {}    -- [player] = { part, expires }
 local Connections = {}
+local Handles = {}
 local ClosestTarget = nil
 local lastTriggerTime = 0
-local lastFriendRefresh = 0
 local frameCounter = 0
 local rewritesThisSecond = 0
 local rewriteSecond = 0
+local internalRaycastDepth = 0
+
+local VIS_CACHE_TTL = 0.25    -- seconds; hard expiry even if positions match
 
 -- Desync state
+local desyncGen = 0
 local desyncThread = nil
 local desyncSavedVelocity = nil
+local desyncState = { anchored = false, physics = false }
 
--- Element handles (for profiles)
-local Handles = {}
+local Camera = workspace.CurrentCamera
 
+-- ═══ SETTINGS ══════════════════════════════════════════════
 local Settings = {
-    -- Combat
-    AimEnabled = false,
-    AimMode = "Silent",
-    AimSmooth = 0,
-    AimFOVSize = 120,
-    AimFOVColor = Color3.fromRGB(255, 0, 0),
-    ShowAimFOV = true,
-    AimMaxDistance = 1000,
-    TargetPriority = "Crosshair",
-    TargetPart = "Head",
-    Predict = true,
-    PredictionAmount = 1,
-    HitboxSize = 0,
-    WallCheck = true,
-    Tracking = true,
-    Triggerbot = false,
-    TriggerbotFOV = 15,
-    TriggerbotCooldown = 0.08,
-    IgnorePassive = false,
-    IgnoreFriends = false,
-    -- Detection resistance
-    StealthMode = false,
-    MaxRewritesPerSecond = 30,
-    AimJitter = 0,
-
-    -- Visuals
+    Enabled = false,
+    AimEnabled = false, AimMode = "Silent", AimSmooth = 0,
+    AimFOVSize = 120, AimFOVColor = Color3.fromRGB(255, 0, 0),
+    ShowAimFOV = true, AimMaxDistance = 1000,
+    TargetPriority = "Crosshair", TargetPart = "Head",
+    Predict = true, PredictionAmount = 1, HitboxSize = 0,
+    WallCheck = true, Tracking = true,
+    Triggerbot = false, TriggerbotFOV = 15, TriggerbotCooldown = 0.08,
+    IgnorePassive = false, IgnoreFriends = false,
+    StealthMode = false, MaxRewritesPerSecond = 30, AimJitter = 0,
     ChamsEnabled = false,
     ChamsFillColor = Color3.fromRGB(255, 0, 0),
     ChamsOutlineColor = Color3.fromRGB(255, 255, 255),
-    ShowBox = true,
-    EspBoxColor = Color3.fromRGB(255, 255, 255),
-    ShowLookTracers = false,
-    LookTracerColor = Color3.fromRGB(255, 200, 0),
-    ShowPlayerTracers = false,
-    PlayerTracerColor = Color3.fromRGB(255, 255, 255),
-    ShowHealth = true,
-    ShowNames = true,
-    ShowDistance = false,
-    ShowFOV = true,
-    FOVSize = 180,
-    FOVColor = Color3.fromRGB(0, 255, 255),
-    MaxDistance = 2000,
-    TeamCheck = true,
-    TextSize = 13,
-
-    -- World
+    ShowBox = true, EspBoxColor = Color3.fromRGB(255, 255, 255),
+    ShowLookTracers = false, LookTracerColor = Color3.fromRGB(255, 200, 0),
+    ShowPlayerTracers = false, PlayerTracerColor = Color3.fromRGB(255, 255, 255),
+    ShowHealth = true, ShowNames = true, ShowDistance = false,
+    ShowFOV = true, FOVSize = 180, FOVColor = Color3.fromRGB(0, 255, 255),
+    MaxDistance = 2000, TeamCheck = true, TextSize = 13,
     Fullbright = false,
-
-    -- Performance
-    PerformanceMode = false,
-
-    -- Desync
-    DesyncEnabled = false,
-    DesyncMethod = "Anchor",
-    DesyncFreezeDuration = 0.5,
-    DesyncCycleInterval = 1.0,
+    PerformanceMode = "Off",
+    DesyncEnabled = false, DesyncMethod = "Anchor",
+    DesyncFreezeDuration = 0.5, DesyncCycleInterval = 1.0,
 }
 
--- ═══ PROFILES ═══════════════════════════════════════════════
 local Profiles = {
     Legit = {
         AimEnabled = true, AimMode = "Camera", AimSmooth = 0.75, AimFOVSize = 40,
@@ -109,20 +112,28 @@ local Profiles = {
     },
 }
 
--- ─── FOV circles ─────────────────────────────────────────────
-local FOVCircle = Drawing.new("Circle")
-FOVCircle.Thickness = 1
-FOVCircle.Filled = false
-FOVCircle.Transparency = 1
-FOVCircle.NumSides = 64
+-- ═══ DRAWING OBJECTS (guarded) ═════════════════════════════
+local FOVCircle, AimFOVCircle
+if Features.Drawing then
+    local ok1, c1 = pcall(Drawing.new, "Circle")
+    local ok2, c2 = pcall(Drawing.new, "Circle")
+    if ok1 and c1 then
+        c1.Thickness = 1; c1.Filled = false; c1.Transparency = 1; c1.NumSides = 64
+        FOVCircle = c1
+    end
+    if ok2 and c2 then
+        c2.Thickness = 1; c2.Filled = false; c2.Transparency = 1; c2.NumSides = 64
+        AimFOVCircle = c2
+    end
+end
 
-local AimFOVCircle = Drawing.new("Circle")
-AimFOVCircle.Thickness = 1
-AimFOVCircle.Filled = false
-AimFOVCircle.Transparency = 1
-AimFOVCircle.NumSides = 64
+local function SafeDrawingNew(class)
+    if not Features.Drawing then return nil end
+    local ok, obj = pcall(Drawing.new, class)
+    return ok and obj or nil
+end
 
--- ─── Helpers ────────────────────────────────────────────────
+-- ═══ HELPERS ═══════════════════════════════════════════════
 local function GetCharacter()
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -140,23 +151,56 @@ local function IsFriend(player)
     return FriendsCache[player.UserId] == true
 end
 
--- ─── ESP lifecycle ──────────────────────────────────────────
+local function CacheKey(origin, targetPos)
+    local function q(v) return math.floor(v * 2 + 0.5) end
+    return string.format("%d|%d|%d|%d|%d|%d",
+        q(origin.X), q(origin.Y), q(origin.Z),
+        q(targetPos.X), q(targetPos.Y), q(targetPos.Z))
+end
+
+local function SelectTargetPart(char, player)
+    if not char then return nil end
+    if Settings.TargetPart ~= "Random" then
+        return char:FindFirstChild(Settings.TargetPart)
+    end
+    if not player then return nil end
+    local now = os.clock()
+    local cached = RandomPartCache[player]
+    if cached and cached.expires > now and cached.part and cached.part.Parent == char then
+        return cached.part
+    end
+    local names = { "Head", "HumanoidRootPart", "UpperTorso", "LowerTorso" }
+    local available = {}
+    for _, name in ipairs(names) do
+        local found = char:FindFirstChild(name)
+        if found then table.insert(available, found) end
+    end
+    if #available == 0 then return nil end
+    local part = available[math.random(1, #available)]
+    RandomPartCache[player] = { part = part, expires = now + 1 }
+    return part
+end
+
+-- ═══ ESP LIFECYCLE ═════════════════════════════════════════
 local function CreateEsp(player)
     if EspObjects[player] or player == LocalPlayer then return end
+    if not Features.Drawing then return end
     local esp = {
-        Box = Drawing.new("Square"), BoxFill = Drawing.new("Square"),
-        Tracer = Drawing.new("Line"), LookTracer = Drawing.new("Line"),
-        HealthBar = Drawing.new("Line"), Name = Drawing.new("Text"),
-        Distance = Drawing.new("Text"),
+        Box = SafeDrawingNew("Square"), BoxFill = SafeDrawingNew("Square"),
+        Tracer = SafeDrawingNew("Line"), LookTracer = SafeDrawingNew("Line"),
+        HealthBar = SafeDrawingNew("Line"), Name = SafeDrawingNew("Text"),
+        Distance = SafeDrawingNew("Text"),
     }
-    esp.Box.Thickness = 1
-    esp.Box.Filled = false
-    esp.BoxFill.Filled = true
-    esp.BoxFill.Transparency = 0.5
-    esp.Name.Center = true
-    esp.Name.Outline = true
-    esp.Distance.Center = true
-    esp.Distance.Outline = true
+    for _, d in pairs(esp) do
+        if not d then
+            for _, dd in pairs(esp) do pcall(function() if dd then dd:Remove() end end) end
+            return
+        end
+    end
+    esp.Box.Thickness = 1; esp.Box.Filled = false
+    esp.BoxFill.Filled = true; esp.BoxFill.Transparency = 0.5
+    esp.Name.Center = true; esp.Name.Outline = true
+    esp.Distance.Center = true; esp.Distance.Outline = true
     for _, d in pairs(esp) do d.Visible = false end
     EspObjects[player] = esp
 end
@@ -168,16 +212,21 @@ local function RemoveEsp(player)
     EspObjects[player] = nil
 end
 
--- ─── Chams lifecycle ────────────────────────────────────────
+-- ═══ CHAMS ═════════════════════════════════════════════════
 local function ApplyChams(char)
     if not char then return nil end
     local hl = char:FindFirstChild("GrexChams")
     if not hl then
-        hl = Instance.new("Highlight")
-        hl.Name = "GrexChams"
-        hl.Adornee = char
-        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-        hl.Parent = char
+        local ok, h = pcall(function()
+            local inst = Instance.new("Highlight")
+            inst.Name = "GrexChams"
+            inst.Adornee = char
+            inst.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            inst.Parent = char
+            return inst
+        end)
+        if not ok then return nil end
+        hl = h
     end
     hl.FillColor = Settings.ChamsFillColor
     hl.OutlineColor = Settings.ChamsOutlineColor
@@ -197,12 +246,13 @@ local function SetupChams(player)
     end))
 end
 
--- ─── Fullbright ─────────────────────────────────────────────
+-- ═══ FULLBRIGHT ════════════════════════════════════════════
 local originalLighting = {
     Ambient = Lighting.Ambient, Brightness = Lighting.Brightness,
     ClockTime = Lighting.ClockTime, OutdoorAmbient = Lighting.OutdoorAmbient,
     FogEnd = Lighting.FogEnd, FogStart = Lighting.FogStart,
 }
+
 local function SetFullbright(en)
     Settings.Fullbright = en
     if en then
@@ -217,21 +267,27 @@ local function SetFullbright(en)
     end
 end
 
--- ─── FOV layout ─────────────────────────────────────────────
+-- ═══ FOV LAYOUT ════════════════════════════════════════════
+-- Called every frame from UpdateAll, and also from toggles that change FOV state.
+-- This guarantees the circles are never left visible after features disable.
 local function UpdateFOVs()
+    if not Camera then return end
     local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
-    FOVCircle.Position = center
-    FOVCircle.Radius = Settings.FOVSize
-    FOVCircle.Color = Settings.FOVColor
-    FOVCircle.Visible = Settings.ShowFOV and (Settings.Enabled or Settings.ChamsEnabled)
-
-    AimFOVCircle.Position = center
-    AimFOVCircle.Radius = Settings.AimFOVSize
-    AimFOVCircle.Color = Settings.AimFOVColor
-    AimFOVCircle.Visible = Settings.ShowAimFOV and Settings.AimEnabled
+    if FOVCircle then
+        FOVCircle.Position = center
+        FOVCircle.Radius = Settings.FOVSize
+        FOVCircle.Color = Settings.FOVColor
+        FOVCircle.Visible = Settings.ShowFOV
+    end
+    if AimFOVCircle then
+        AimFOVCircle.Position = center
+        AimFOVCircle.Radius = Settings.AimFOVSize
+        AimFOVCircle.Color = Settings.AimFOVColor
+        AimFOVCircle.Visible = Settings.ShowAimFOV and Settings.AimEnabled
+    end
 end
 
--- ─── Weapon fire ────────────────────────────────────────────
+-- ═══ WEAPON FIRE ═══════════════════════════════════════════
 local function FireWeapon()
     if mouse1click then mouse1click()
     elseif VirtualUser and VirtualUser.ClickButton1 then
@@ -241,69 +297,118 @@ local function FireWeapon()
     end
 end
 
--- ─── Camera lock ────────────────────────────────────────────
-local function ApplyCameraLock()
-    if not (Settings.AimEnabled and Settings.AimMode == "Camera" and ClosestTarget) then return end
-    local char = ClosestTarget.Character
-    if not char then return end
-    local part = char:FindFirstChild(Settings.TargetPart == "Random" and "Head" or Settings.TargetPart)
-    if not part then return end
+-- ═══ PREDICTED AIM POINT ═══════════════════════════════════
+local function GetAimPoint(player)
+    local char = player.Character
+    if not char then return nil end
+    local part = SelectTargetPart(char, player)
+    if not part then return nil end
 
-    local targetPos = part.Position
+    local pos = part.Position
     if Settings.Predict then
         local root = char.PrimaryPart
         if root then
             local ping = Stats.Network.ServerStatsItem["Data Ping"]:GetValue() / 1000
-            targetPos = targetPos + root.AssemblyLinearVelocity * (ping * Settings.PredictionAmount)
+            pos = pos + root.AssemblyLinearVelocity * (ping * Settings.PredictionAmount)
         end
     end
 
+    local s = Settings.HitboxSize
+    if s > 0 then
+        pos = pos + Vector3.new(
+            math.random(-100, 100) / 100 * s,
+            math.random(-50, 50) / 100 * s,
+            math.random(-100, 100) / 100 * s
+        )
+    end
+
+    if Settings.StealthMode and Settings.AimJitter > 0 then
+        local j = Settings.AimJitter
+        pos = pos + Vector3.new(
+            math.random(-100, 100) / 100 * j,
+            math.random(-100, 100) / 100 * j,
+            math.random(-100, 100) / 100 * j
+        )
+    end
+    return pos
+end
+
+-- ═══ CAMERA LOCK ═══════════════════════════════════════════
+local function ApplyCameraLock()
+    if not (Settings.AimEnabled and Settings.AimMode == "Camera" and ClosestTarget and Camera) then return end
+    local targetPos = GetAimPoint(ClosestTarget)
+    if not targetPos then return end
     local alpha = math.clamp(1 - Settings.AimSmooth, 0.01, 1)
     if Settings.StealthMode then alpha = alpha * alpha end
     local goal = CFrame.new(Camera.CFrame.Position, targetPos)
     Camera.CFrame = Camera.CFrame:Lerp(goal, alpha)
 end
 
--- ─── Target selection ───────────────────────────────────────
-local function IsBetterTarget(player, char, hum, root, dist3d, screenDist, bestScore, bestPlayer)
-    if not bestPlayer then return true end
+-- ═══ TARGET SCORING ════════════════════════════════════════
+local function GetTargetScore(hum, root, dist3d, screenDist)
     local prio = Settings.TargetPriority
     if prio == "Distance" then
-        return dist3d < bestScore
+        return dist3d
     elseif prio == "LowestHealth" then
-        return hum.Health < bestScore
+        return hum.Health
     elseif prio == "Threat" then
-        local look = Camera.CFrame.LookVector
-        local toMe = (LocalPlayer.Character and LocalPlayer.Character.PrimaryPart
-            and (LocalPlayer.Character.PrimaryPart.Position - root.Position).Unit) or Vector3.zero
-        local threat = (1 - look:Dot(toMe)) * 0.5 + dist3d / Settings.AimMaxDistance
-        return threat < bestScore
+        local targetHead = root.Parent and root.Parent:FindFirstChild("Head")
+        if not targetHead then return math.huge end
+        local look = targetHead.CFrame.LookVector
+        local lpChar = LocalPlayer.Character
+        local lpRoot = lpChar and lpChar.PrimaryPart
+        if not lpRoot then return math.huge end
+        local toMe = (lpRoot.Position - targetHead.Position).Unit
+        local facing = look:Dot(toMe)
+        return (1 - facing) * 0.5 + dist3d / Settings.AimMaxDistance
     end
-    return screenDist < bestScore
+    return screenDist
 end
 
--- ═══ DESYNC METHODS ═════════════════════════════════════════
--- Educational reference only. On modern Roblox servers, most of these
--- are corrected by server-side position integrity checks within 1–2s.
+-- ═══ VISIBILITY (position-keyed + time-expiring cache) ════
+local function CheckVisible(player, origin, targetPos, filter)
+    local key = CacheKey(origin, targetPos)
+    local now = os.clock()
+    local cached = VisibilityCache[player]
+    if cached and cached.key == key and (now - cached.tick) < VIS_CACHE_TTL then
+        return cached.visible
+    end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    params.FilterDescendantsInstances = filter
+    internalRaycastDepth = internalRaycastDepth + 1
+    local ok, result = pcall(function() return workspace:Raycast(origin, targetPos - origin, params) end)
+    internalRaycastDepth = internalRaycastDepth - 1
+    local visible = ok and (result == nil)
+    VisibilityCache[player] = { visible = visible, key = key, tick = now }
+    return visible
+end
 
+-- ═══ DESYNC ════════════════════════════════════════════════
 local function DesyncAnchor()
     local _, _, root = GetCharacter()
     if not root then return end
     desyncSavedVelocity = root.AssemblyLinearVelocity
-    pcall(function() root.Anchored = true end)
+    local ok1 = pcall(function() root.Anchored = true end)
+    if not ok1 then
+        warn("[Grex] DesyncAnchor: anchor failed")
+        return
+    end
+    desyncState.anchored = true
     task.wait(Settings.DesyncFreezeDuration)
-    pcall(function()
+    local ok2 = pcall(function()
         root.Anchored = false
         if desyncSavedVelocity then
             root.AssemblyLinearVelocity = desyncSavedVelocity
         end
     end)
+    if ok2 then desyncState.anchored = false end
 end
 
 local function DesyncVelocity()
     local _, _, root = GetCharacter()
     if not root then return end
-    local dir = Camera.CFrame.LookVector
+    local dir = Camera and Camera.CFrame.LookVector or Vector3.new(0, 0, -1)
     pcall(function()
         root.AssemblyLinearVelocity = dir * 500 + Vector3.new(0, 50, 0)
     end)
@@ -314,9 +419,11 @@ end
 local function DesyncHumanoidState()
     local char, hum = GetCharacter()
     if not (char and hum) then return end
-    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+    local ok1 = pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+    if ok1 then desyncState.physics = true end
     task.wait(Settings.DesyncFreezeDuration)
-    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+    local ok2 = pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+    if ok2 then desyncState.physics = false end
 end
 
 local function DesyncOwnership()
@@ -327,14 +434,12 @@ local function DesyncOwnership()
 end
 
 local DesyncMethods = {
-    Anchor = DesyncAnchor,
-    Velocity = DesyncVelocity,
-    HumanoidState = DesyncHumanoidState,
-    Ownership = DesyncOwnership,
+    Anchor = DesyncAnchor, Velocity = DesyncVelocity,
+    HumanoidState = DesyncHumanoidState, Ownership = DesyncOwnership,
 }
 
-local function DesyncLoop()
-    while Settings.DesyncEnabled do
+local function DesyncLoop(myGen)
+    while Settings.DesyncEnabled and desyncGen == myGen do
         local char = GetCharacter()
         if char then
             local method = DesyncMethods[Settings.DesyncMethod]
@@ -344,35 +449,49 @@ local function DesyncLoop()
     end
 end
 
-local function ToggleDesync(en)
-    Settings.DesyncEnabled = en
-    if en then
-        if not desyncThread then
-            desyncThread = task.spawn(DesyncLoop)
-        end
-    else
-        desyncThread = nil
-        -- Always restore a safe state on disable
-        local _, hum, root = GetCharacter()
-        if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end) end
-        if root then
-            pcall(function()
-                root.Anchored = false
-                root.AssemblyLinearVelocity = Vector3.zero
-            end)
-        end
+local function RestoreCharacterState()
+    local _, hum, root = GetCharacter()
+    if hum and desyncState.physics then
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+        desyncState.physics = false
+    end
+    if root and desyncState.anchored then
+        pcall(function() root.Anchored = false end)
+        desyncState.anchored = false
     end
 end
 
--- ─── Main loop ──────────────────────────────────────────────
+local function ToggleDesync(en)
+    Settings.DesyncEnabled = en
+    desyncGen = desyncGen + 1
+    if en then
+        local gen = desyncGen
+        desyncThread = task.spawn(function() DesyncLoop(gen) end)
+    else
+        desyncThread = nil
+        RestoreCharacterState()
+    end
+end
+
+-- ═══ MAIN UPDATE LOOP ══════════════════════════════════════
 local function UpdateAll()
+    Camera = workspace.CurrentCamera
+    if not Camera then return end
+
+    -- FOV must be refreshed even when the main features are off, so the
+    -- circle visibility tracks the toggle state immediately.
     if not (Settings.Enabled or Settings.AimEnabled or Settings.Triggerbot or Settings.ChamsEnabled) then
+        UpdateFOVs()
         return
     end
 
     frameCounter = frameCounter + 1
     local renderThisFrame = true
-    if Settings.PerformanceMode and frameCounter % 2 ~= 0 then
+    if Settings.PerformanceMode ~= "Off" and frameCounter % 2 ~= 0 then
+        if Settings.PerformanceMode == "Half-Rate All" then
+            UpdateFOVs()
+            return
+        end
         renderThisFrame = false
     end
 
@@ -412,20 +531,22 @@ local function UpdateAll()
                 local headPos3d = head.Position
                 local headScreen, onScreen = Camera:WorldToViewportPoint(headPos3d)
                 local teamBlocked = Settings.TeamCheck and player.Team == LocalPlayer.Team
-
-                local isPassive = Settings.IgnorePassive and
-                    (hum.MoveDirection.Magnitude < 0.1 and root.AssemblyLinearVelocity.Magnitude < 2)
+                local isPassive = Settings.IgnorePassive
+                    and hum.MoveDirection.Magnitude < 0.1
+                    and root.AssemblyLinearVelocity.Magnitude < 2
                 local isFriendBlocked = Settings.IgnoreFriends and IsFriend(player)
                 local blocked = teamBlocked or isPassive or isFriendBlocked
 
+                local needWall = (Settings.AimEnabled or Settings.Triggerbot)
+                    and Settings.WallCheck and onScreen and not blocked
                 local isVisible = true
-                if (Settings.AimEnabled or Settings.Triggerbot) and Settings.WallCheck and onScreen and not blocked then
-                    local origin = Camera.CFrame.Position
-                    local params = RaycastParams.new()
-                    params.FilterType = Enum.RaycastFilterType.Blacklist
-                    params.FilterDescendantsInstances = { LocalPlayer.Character, char }
-                    local ok, result = pcall(function() return workspace:Raycast(origin, headPos3d - origin, params) end)
-                    isVisible = ok and (result == nil)
+                if needWall then
+                    isVisible = CheckVisible(
+                        player,
+                        Camera.CFrame.Position,
+                        headPos3d,
+                        { LocalPlayer.Character, char }
+                    )
                 end
 
                 local screenDist = (Vector2.new(headScreen.X, headScreen.Y) - center2d).Magnitude
@@ -434,10 +555,9 @@ local function UpdateAll()
                     and screenDist <= Settings.AimFOVSize
                     and dist3d <= Settings.AimMaxDistance
                     and isVisible then
-                    if IsBetterTarget(player, char, hum, root, dist3d, screenDist, bestScore, ClosestTarget) then
-                        bestScore = (Settings.TargetPriority == "Distance" and dist3d)
-                            or (Settings.TargetPriority == "LowestHealth" and hum.Health)
-                            or screenDist
+                    local score = GetTargetScore(hum, root, dist3d, screenDist)
+                    if score < bestScore then
+                        bestScore = score
                         ClosestTarget = player
                     end
                 end
@@ -529,117 +649,91 @@ local function SafeUpdate()
     if not ok then warn("[Grex] UpdateAll error:", err) end
 end
 
--- ─── Predicted aim point ────────────────────────────────────
-local function GetPredictedPos(targetPlayer)
-    local char = targetPlayer.Character
-    if not char then return nil end
-    local part
-    if Settings.TargetPart == "Random" then
-        local candidates = { "Head", "HumanoidRootPart", "UpperTorso", "LowerTorso" }
-        local available = {}
-        for _, name in ipairs(candidates) do
-            local found = char:FindFirstChild(name)
-            if found then table.insert(available, found) end
-        end
-        if #available == 0 then return nil end
-        part = available[math.random(1, #available)]
-    else
-        part = char:FindFirstChild(Settings.TargetPart)
-    end
-    if not part then return nil end
+-- ═══ SILENT-AIM HOOK ═══════════════════════════════════════
+if HookReady then
+    local ok, mt = pcall(getrawmetatable, game)
+    if ok and mt then
+        setreadonly(mt, false)
+        local oldRaycast = mt.__namecall
+        mt.__namecall = newcclosure(function(self, ...)
+            local args = { ... }
+            local method = getnamecallmethod()
 
-    local targetPos = part.Position
-    if Settings.Predict then
-        local root = char.PrimaryPart
-        if root then
-            local ping = Stats.Network.ServerStatsItem["Data Ping"]:GetValue() / 1000
-            targetPos = targetPos + root.AssemblyLinearVelocity * (ping * Settings.PredictionAmount)
-        end
-    end
-
-    local s = Settings.HitboxSize
-    targetPos = targetPos + Vector3.new(
-        math.random(-100, 100) / 100 * s,
-        math.random(-50, 50) / 100 * s,
-        math.random(-100, 100) / 100 * s
-    )
-
-    if Settings.StealthMode and Settings.AimJitter > 0 then
-        targetPos = targetPos + Vector3.new(
-            math.random(-100, 100) / 100 * Settings.AimJitter,
-            math.random(-100, 100) / 100 * Settings.AimJitter,
-            math.random(-100, 100) / 100 * Settings.AimJitter
-        )
-    end
-    return targetPos
-end
-
--- ─── Silent-aim raycast hook (rate-limited) ─────────────────
-local mt = getrawmetatable(game)
-local oldRaycast = mt.__namecall
-setreadonly(mt, false)
-
-mt.__namecall = newcclosure(function(self, ...)
-    local args = { ... }
-    local method = getnamecallmethod()
-
-    if Settings.AimEnabled and Settings.AimMode == "Silent" and Settings.Tracking
-        and ClosestTarget and method == "Raycast" and self == workspace then
-
-        local now = os.clock()
-        if now - rewriteSecond >= 1 then
-            rewriteSecond = now
-            rewritesThisSecond = 0
-        end
-        if rewritesThisSecond >= Settings.MaxRewritesPerSecond then
-            return oldRaycast(self, unpack(args))
-        end
-
-        local origin, direction = args[1], args[2]
-        local targetPos = GetPredictedPos(ClosestTarget)
-        if targetPos then
-            local desiredDir = (targetPos - origin).Unit
-            local finalDir = desiredDir
-            if Settings.AimSmooth > 0 then
-                local alpha = math.clamp(1 - Settings.AimSmooth, 0.01, 1)
-                if Settings.StealthMode then alpha = alpha * alpha end
-                finalDir = direction.Unit:Lerp(desiredDir, alpha).Unit
+            if internalRaycastDepth > 0 then
+                return oldRaycast(self, unpack(args))
             end
-            args[2] = finalDir * direction.Magnitude
-            rewritesThisSecond = rewritesThisSecond + 1
-        end
+
+            if Settings.AimEnabled and Settings.AimMode == "Silent" and Settings.Tracking
+                and ClosestTarget and method == "Raycast" and self == workspace then
+
+                local now = os.clock()
+                if now - rewriteSecond >= 1 then
+                    rewriteSecond = now
+                    rewritesThisSecond = 0
+                end
+                if rewritesThisSecond >= Settings.MaxRewritesPerSecond then
+                    return oldRaycast(self, unpack(args))
+                end
+
+                local origin, direction = args[1], args[2]
+                local mag = direction and direction.Magnitude or 0
+                if type(origin) == "Vector3" and type(direction) == "Vector3"
+                    and mag >= 10 and mag <= 5000 then
+                    local targetPos = GetAimPoint(ClosestTarget)
+                    if targetPos then
+                        local desiredDir = (targetPos - origin).Unit
+                        local finalDir = desiredDir
+                        if Settings.AimSmooth > 0 then
+                            local alpha = math.clamp(1 - Settings.AimSmooth, 0.01, 1)
+                            if Settings.StealthMode then alpha = alpha * alpha end
+                            finalDir = direction.Unit:Lerp(desiredDir, alpha).Unit
+                        end
+                        args[2] = finalDir * mag
+                        rewritesThisSecond = rewritesThisSecond + 1
+                    end
+                end
+            end
+
+            return oldRaycast(self, unpack(args))
+        end)
+        setreadonly(mt, true)
+    else
+        warn("[Grex] getrawmetatable failed; silent aim disabled.")
     end
-
-    return oldRaycast(self, unpack(args))
-end)
-setreadonly(mt, true)
-
--- ─── Teardown ───────────────────────────────────────────────
-local function DestroyAll()
-    -- Stop desync and restore a safe state
-    Settings.DesyncEnabled = false
-    desyncThread = nil
-    do
-        local _, hum, root = GetCharacter()
-        if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end) end
-        if root then
-            pcall(function()
-                root.Anchored = false
-                root.AssemblyLinearVelocity = Vector3.zero
-            end)
-        end
-    end
-
-    pcall(function() setreadonly(mt, false); mt.__namecall = oldRaycast; setreadonly(mt, true) end)
-    for p in pairs(EspObjects) do RemoveEsp(p) end
-    for p, hl in pairs(ChamsObjects) do pcall(function() if hl and hl.Parent then hl:Destroy() end end) end
-    if Settings.Fullbright then SetFullbright(false) end
-    pcall(function() FOVCircle:Remove(); AimFOVCircle:Remove() end)
-    pcall(function() Rayfield:Destroy() end)
-    for _, conn in ipairs(Connections) do pcall(function() conn:Disconnect() end) end
+else
+    warn("[Grex] Metatable primitives missing; silent aim disabled.")
 end
 
--- ─── Player population ──────────────────────────────────────
+-- ═══ TEARDOWN ══════════════════════════════════════════════
+local destroyed = false
+local function DestroyAll()
+    if destroyed then return end
+    destroyed = true
+
+    Settings.DesyncEnabled = false
+    desyncGen = desyncGen + 1
+    desyncThread = nil
+    RestoreCharacterState()
+
+    for p in pairs(EspObjects) do RemoveEsp(p) end
+    for _, hl in pairs(ChamsObjects) do
+        pcall(function() if hl and hl.Parent then hl:Destroy() end end)
+    end
+    ChamsObjects = {}
+
+    if Settings.Fullbright then
+        pcall(SetFullbright, false)
+        if Handles.Fullbright then pcall(function() Handles.Fullbright:Set(false, true) end) end
+    end
+
+    if FOVCircle then pcall(function() FOVCircle:Remove() end) end
+    if AimFOVCircle then pcall(function() AimFOVCircle:Remove() end) end
+
+    for _, conn in ipairs(Connections) do pcall(function() conn:Disconnect() end) end
+    pcall(function() Rayfield:Destroy() end)
+end
+
+-- ═══ PLAYER POPULATION ═════════════════════════════════════
 for _, p in ipairs(Players:GetPlayers()) do
     CreateEsp(p); SetupChams(p)
     if p ~= LocalPlayer then task.spawn(RefreshFriendStatus, p) end
@@ -647,34 +741,44 @@ end
 
 table.insert(Connections, Players.PlayerAdded:Connect(function(p)
     CreateEsp(p); SetupChams(p); task.spawn(RefreshFriendStatus, p)
+    table.insert(Connections, p.CharacterRemoving:Connect(function()
+        local esp = EspObjects[p]
+        if esp then for _, d in pairs(esp) do d.Visible = false end end
+        VisibilityCache[p] = nil
+        RandomPartCache[p] = nil
+    end))
 end))
+
 table.insert(Connections, Players.PlayerRemoving:Connect(function(p)
     RemoveEsp(p)
     local hl = ChamsObjects[p]
     if hl and hl.Parent then pcall(function() hl:Destroy() end) end
     ChamsObjects[p] = nil
     FriendsCache[p.UserId] = nil
+    VisibilityCache[p] = nil
+    RandomPartCache[p] = nil
 end))
 
 for _, p in ipairs(Players:GetPlayers()) do
     table.insert(Connections, p.CharacterRemoving:Connect(function()
         local esp = EspObjects[p]
         if esp then for _, d in pairs(esp) do d.Visible = false end end
+        VisibilityCache[p] = nil
+        RandomPartCache[p] = nil
     end))
 end
-table.insert(Connections, Players.PlayerAdded:Connect(function(p)
-    table.insert(Connections, p.CharacterRemoving:Connect(function()
-        local esp = EspObjects[p]
-        if esp then for _, d in pairs(esp) do d.Visible = false end end
-    end))
+
+table.insert(Connections, LocalPlayer.CharacterAdded:Connect(function()
+    VisibilityCache = {}
+    RandomPartCache = {}
 end))
 
 table.insert(Connections, RunService.RenderStepped:Connect(SafeUpdate))
 
--- ═══ UI (Rayfield Gen2) ═════════════════════════════════════
+-- ═══ UI ════════════════════════════════════════════════════
 local Window = Rayfield:CreateWindow({
     name = "🦎 Grex UI",
-    subtitle = "Rayfield Gen2",
+    subtitle = "Velocity Compatible",
     sidebarLayout = true,
     configuration = {
         autoSave = true, autoLoad = true,
@@ -702,33 +806,33 @@ CombatTab:CreateKeybind({
     end,
 })
 
-CombatTab:CreateDropdown({
+Handles.AimMode = CombatTab:CreateDropdown({
     name = "Aim Mode", options = { "Silent", "Camera" },
     multiSelect = false, value = Settings.AimMode, flag = "Aim_Mode",
     callback = function(v) Settings.AimMode = v end,
 })
 
-CombatTab:CreateSlider({
+Handles.AimSmooth = CombatTab:CreateSlider({
     name = "Aim Smoothness", range = { 0, 1 }, increment = 0.01,
     value = Settings.AimSmooth, flag = "Aim_Smooth",
     callback = function(v) Settings.AimSmooth = v end,
 })
 
-CombatTab:CreateDropdown({
+Handles.TargetPriority = CombatTab:CreateDropdown({
     name = "Target Priority",
     options = { "Crosshair", "Distance", "LowestHealth", "Threat" },
     multiSelect = false, value = Settings.TargetPriority, flag = "Aim_Priority",
     callback = function(v) Settings.TargetPriority = v end,
 })
 
-CombatTab:CreateDropdown({
+Handles.TargetPart = CombatTab:CreateDropdown({
     name = "Target Part",
     options = { "Head", "HumanoidRootPart", "UpperTorso", "LowerTorso", "Random" },
     multiSelect = false, value = Settings.TargetPart, flag = "Aim_Part",
     callback = function(v) Settings.TargetPart = v end,
 })
 
-CombatTab:CreateSlider({
+Handles.AimFOVSize = CombatTab:CreateSlider({
     name = "FOV Size", range = { 10, 600 }, increment = 5,
     value = Settings.AimFOVSize, flag = "Aim_FOV",
     callback = function(v) Settings.AimFOVSize = v end,
@@ -736,7 +840,7 @@ CombatTab:CreateSlider({
 
 CombatTab:CreateToggle({
     name = "Show FOV", value = Settings.ShowAimFOV, flag = "Aim_ShowFOV",
-    callback = function(v) Settings.ShowAimFOV = v end,
+    callback = function(v) Settings.ShowAimFOV = v; UpdateFOVs() end,
 })
 
 CombatTab:CreateColorPicker({
@@ -765,6 +869,12 @@ CombatTab:CreateSlider({
     name = "Triggerbot FOV (px)", range = { 1, 60 }, increment = 1,
     value = Settings.TriggerbotFOV, flag = "Trigger_FOV",
     callback = function(v) Settings.TriggerbotFOV = v end,
+})
+
+Handles.TriggerbotCooldown = CombatTab:CreateSlider({
+    name = "Triggerbot Cooldown (s)", range = { 0.02, 0.5 }, increment = 0.01,
+    value = Settings.TriggerbotCooldown, flag = "Trigger_Cooldown",
+    callback = function(v) Settings.TriggerbotCooldown = v end,
 })
 
 CombatTab:CreateSection("Filters")
@@ -801,13 +911,17 @@ local VisualsTab = Window:CreateTab({ name = "Visuals", icon = "eye" })
 
 VisualsTab:CreateSection("ESP")
 
-VisualsTab:CreateToggle({
+Handles.Enabled = VisualsTab:CreateToggle({
     name = "Enable ESP Boxes", value = Settings.Enabled, flag = "ESP_Main",
     callback = function(v) Settings.Enabled = v end,
 })
 VisualsTab:CreateColorPicker({
     name = "ESP Box Color", value = Settings.EspBoxColor, flag = "ESP_BoxColor",
     callback = function(c) Settings.EspBoxColor = c end,
+})
+VisualsTab:CreateToggle({
+    name = "Show FOV Circle", value = Settings.ShowFOV, flag = "ESP_ShowFOV",
+    callback = function(v) Settings.ShowFOV = v; UpdateFOVs() end,
 })
 VisualsTab:CreateToggle({
     name = "Healthbar", value = Settings.ShowHealth, flag = "ESP_Health",
@@ -838,7 +952,7 @@ VisualsTab:CreateSlider({
 
 VisualsTab:CreateSection("Chams")
 
-VisualsTab:CreateToggle({
+Handles.ChamsEnabled = VisualsTab:CreateToggle({
     name = "Enable Chams", value = Settings.ChamsEnabled, flag = "Chams_Main",
     callback = function(v)
         Settings.ChamsEnabled = v
@@ -868,7 +982,7 @@ VisualsTab:CreateColorPicker({
 
 VisualsTab:CreateSection("Tracers")
 
-VisualsTab:CreateToggle({
+Handles.ShowLookTracers = VisualsTab:CreateToggle({
     name = "Look Tracers", value = Settings.ShowLookTracers, flag = "Tracer_Look",
     callback = function(v) Settings.ShowLookTracers = v end,
 })
@@ -876,7 +990,7 @@ VisualsTab:CreateColorPicker({
     name = "Look Tracer Color", value = Settings.LookTracerColor, flag = "Tracer_LookColor",
     callback = function(c) Settings.LookTracerColor = c end,
 })
-VisualsTab:CreateToggle({
+Handles.ShowPlayerTracers = VisualsTab:CreateToggle({
     name = "Player Tracers", value = Settings.ShowPlayerTracers, flag = "Tracer_Player",
     callback = function(v) Settings.ShowPlayerTracers = v end,
 })
@@ -889,43 +1003,28 @@ VisualsTab:CreateColorPicker({
 local DesyncTab = Window:CreateTab({ name = "Desync", icon = "wifi-off" })
 
 DesyncTab:CreateSection("Position Desync")
-
 DesyncTab:CreateToggle({
-    name = "Enable Desync",
-    value = Settings.DesyncEnabled,
-    flag = "DS_Main",
+    name = "Enable Desync", value = Settings.DesyncEnabled, flag = "DS_Main",
     callback = ToggleDesync,
 })
-
 DesyncTab:CreateDropdown({
     name = "Method",
     options = { "Anchor", "Velocity", "HumanoidState", "Ownership" },
-    multiSelect = false,
-    value = Settings.DesyncMethod,
-    flag = "DS_Method",
+    multiSelect = false, value = Settings.DesyncMethod, flag = "DS_Method",
     callback = function(v) Settings.DesyncMethod = v end,
 })
-
 DesyncTab:CreateSlider({
-    name = "Freeze Duration (s)",
-    range = { 0.05, 2 },
-    increment = 0.05,
-    value = Settings.DesyncFreezeDuration,
-    flag = "DS_FreezeDuration",
+    name = "Freeze Duration (s)", range = { 0.05, 2 }, increment = 0.05,
+    value = Settings.DesyncFreezeDuration, flag = "DS_FreezeDuration",
     callback = function(v) Settings.DesyncFreezeDuration = v end,
 })
-
 DesyncTab:CreateSlider({
-    name = "Cycle Interval (s)",
-    range = { 0.1, 5 },
-    increment = 0.1,
-    value = Settings.DesyncCycleInterval,
-    flag = "DS_CycleInterval",
+    name = "Cycle Interval (s)", range = { 0.1, 5 }, increment = 0.1,
+    value = Settings.DesyncCycleInterval, flag = "DS_CycleInterval",
     callback = function(v) Settings.DesyncCycleInterval = v end,
 })
 
 DesyncTab:CreateSection("Diagnostics")
-
 DesyncTab:CreateButton({
     name = "Log Position (3s)",
     callback = function()
@@ -937,16 +1036,15 @@ DesyncTab:CreateButton({
         local _, _, root2 = GetCharacter()
         if not root2 then return end
         local endPos = root2.Position
-        local delta = (endPos - startPos).Magnitude
         print(string.format("[Grex] End: %.1f, %.1f, %.1f (moved %.1f studs)",
-            endPos.X, endPos.Y, endPos.Z, delta))
+            endPos.X, endPos.Y, endPos.Z, (endPos - startPos).Magnitude))
     end,
 })
 
 -- ══ WORLD ══════════════════════════════════════════════════
 local WorldTab = Window:CreateTab({ name = "World", icon = "sun" })
 
-WorldTab:CreateToggle({
+Handles.Fullbright = WorldTab:CreateToggle({
     name = "Fullbright", value = Settings.Fullbright, flag = "World_Fullbright",
     callback = SetFullbright,
 })
@@ -955,6 +1053,9 @@ WorldTab:CreateButton({
     callback = function()
         for k, v in pairs(originalLighting) do Lighting[k] = v end
         Settings.Fullbright = false
+        if Handles.Fullbright then
+            pcall(function() Handles.Fullbright:Set(false, true) end)
+        end
     end,
 })
 
@@ -962,14 +1063,14 @@ WorldTab:CreateButton({
 local ConfigTab = Window:CreateTab({ name = "Config", icon = "settings" })
 
 ConfigTab:CreateSection("Profiles")
-
 ConfigTab:CreateButton({
     name = "Apply: Legit",
     callback = function()
         for k, v in pairs(Profiles.Legit) do
             Settings[k] = v
-            if Handles[k] then Handles[k]:Set(v, true) end
+            if Handles[k] then pcall(function() Handles[k]:Set(v, true) end) end
         end
+        UpdateFOVs()
     end,
 })
 ConfigTab:CreateButton({
@@ -977,8 +1078,9 @@ ConfigTab:CreateButton({
     callback = function()
         for k, v in pairs(Profiles.Semi) do
             Settings[k] = v
-            if Handles[k] then Handles[k]:Set(v, true) end
+            if Handles[k] then pcall(function() Handles[k]:Set(v, true) end) end
         end
+        UpdateFOVs()
     end,
 })
 ConfigTab:CreateButton({
@@ -986,39 +1088,38 @@ ConfigTab:CreateButton({
     callback = function()
         for k, v in pairs(Profiles.Rage) do
             Settings[k] = v
-            if Handles[k] then Handles[k]:Set(v, true) end
+            if Handles[k] then pcall(function() Handles[k]:Set(v, true) end) end
         end
+        UpdateFOVs()
     end,
 })
 
 ConfigTab:CreateSection("Performance")
-
-ConfigTab:CreateToggle({
-    name = "Performance Mode (half-rate ESP)",
-    value = Settings.PerformanceMode, flag = "Perf_Mode",
+ConfigTab:CreateDropdown({
+    name = "Performance Mode",
+    options = { "Off", "Half-Rate ESP", "Half-Rate All" },
+    multiSelect = false, value = Settings.PerformanceMode, flag = "Perf_Mode",
     callback = function(v) Settings.PerformanceMode = v end,
 })
 
-ConfigTab:CreateSection("Detection Resistance")
+ConfigTab:CreateSection("Behavior Shaping")
+ConfigTab:CreateLabel("Reduces obviousness. Does NOT evade detection.")
 
-ConfigTab:CreateToggle({
+Handles.StealthMode = ConfigTab:CreateToggle({
     name = "Stealth Mode",
-    description = "Ease-out aim, jitter, no Rage profile",
+    description = "Ease-out aim + jitter. Cosmetic, not a bypass.",
     value = Settings.StealthMode, flag = "Stealth_Main",
     callback = function(v) Settings.StealthMode = v end,
 })
-ConfigTab:CreateSlider({
+Handles.AimJitter = ConfigTab:CreateSlider({
     name = "Aim Jitter", range = { 0, 0.1 }, increment = 0.001,
     value = Settings.AimJitter, flag = "Stealth_Jitter",
     callback = function(v) Settings.AimJitter = v end,
 })
-ConfigTab:CreateSlider({
+Handles.MaxRewritesPerSecond = ConfigTab:CreateSlider({
     name = "Max Raycast Rewrites / sec", range = { 5, 120 }, increment = 1,
     value = Settings.MaxRewritesPerSecond, flag = "Stealth_Rewrites",
     callback = function(v) Settings.MaxRewritesPerSecond = v end,
 })
 
-ConfigTab:CreateButton({
-    name = "Unload Script",
-    callback = DestroyAll,
-})
+ConfigTab:CreateButton({ name = "Unload Script", callback = DestroyAll })
